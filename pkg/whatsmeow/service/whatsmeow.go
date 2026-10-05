@@ -70,6 +70,54 @@ type WhatsmeowService interface {
 	ConfirmPasskey(instanceId string) error
 }
 
+
+// Shared whatsmeow store container.
+//
+// sqlstore.New opens its own *sql.DB pool. It used to be called once per
+// StartClient and never closed, so every connect/QR-refresh attempt leaked a
+// whole uncapped pool until Postgres answered "sorry, too many clients
+// already" — at which point StartClient bailed out before Connect(), no
+// events.QR was ever emitted, and /instance/qr sat through its 3s+2s sleeps
+// and returned "no QR code available". One container for the process fixes
+// that; the pool it owns is reused by every instance.
+//
+// Guarded by a mutex rather than sync.Once so a failed attempt (DB down at
+// boot) can be retried on the next call instead of being cached forever.
+var (
+	storeContainerMu sync.Mutex
+	storeContainer   *sqlstore.Container
+)
+
+func (w whatsmeowService) getStoreContainer() (*sqlstore.Container, error) {
+	storeContainerMu.Lock()
+	defer storeContainerMu.Unlock()
+
+	if storeContainer != nil {
+		return storeContainer, nil
+	}
+
+	var dbLog waLog.Logger
+	if w.config.WaDebug != "" {
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	var container *sqlstore.Container
+	var err error
+
+	if w.config.PostgresAuthDB != "" {
+		container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
+	} else {
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	storeContainer = container
+	return storeContainer, nil
+}
 type clientVersion struct {
 	Major int
 	Minor int
@@ -314,25 +362,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
-
+	container, err := w.getStoreContainer()
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
 		return
@@ -2324,6 +2354,15 @@ func (w whatsmeowService) StartInstance(instanceId string) error {
 	instance, err := w.instanceRepository.GetInstanceByID(instanceId)
 	if err != nil {
 		return err
+	}
+
+	// Open (or reuse) the store container up front. StartClient runs in a
+	// goroutine and discards its error, so a DB failure there is invisible to
+	// the caller and surfaces as a misleading "no QR code available" 5s later.
+	// Checking here lets /instance/qr report the real cause.
+	if _, err := w.getStoreContainer(); err != nil {
+		w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Failed to open whatsmeow store: %v", instanceId, err)
+		return fmt.Errorf("failed to open whatsmeow store: %w", err)
 	}
 
 	if instance.Proxy == "" && w.config.ProxyHost != "" && w.config.ProxyPort != "" && w.config.ProxyUsername != "" && w.config.ProxyPassword != "" {

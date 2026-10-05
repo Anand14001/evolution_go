@@ -1,0 +1,4 @@
+services:
+  evolution-go:
+    environment:
+      GLOBAL_API_KEY: "10836BED209C555A28734F2F74CD4081"
