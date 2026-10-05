@@ -413,8 +413,10 @@ func main() {
 
 	core.StartHeartbeat(heartbeatCtx, runtimeCtx, startTime)
 
+	port := resolvePort()
+
 	srv := &http.Server{
-		Addr:    ":" + os.Getenv("SERVER_PORT"),
+		Addr:    ":" + port,
 		Handler: r,
 	}
 
@@ -422,7 +424,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		logger.LogInfo("Iniciando servidor na porta %s", os.Getenv("SERVER_PORT"))
+		logger.LogInfo("Iniciando servidor na porta %s", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
 		}
@@ -444,4 +446,17 @@ func main() {
 	}
 
 	logger.LogInfo("[SHUTDOWN] Server exited")
+}
+
+// resolvePort returns the TCP port the HTTP server should listen on.
+// SERVER_PORT wins; PORT is the fallback injected by PaaS providers
+// (Railway, Render, Heroku); 8080 is the last resort so the server never
+// ends up on an OS-assigned random port.
+func resolvePort() string {
+	for _, key := range []string{"SERVER_PORT", "PORT"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return "8080"
 }
